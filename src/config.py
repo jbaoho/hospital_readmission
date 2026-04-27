@@ -14,7 +14,10 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 RESULTS_DIR = PROJECT_ROOT / "results"
 FIGURES_DIR = RESULTS_DIR / "figures"
 MODELS_DIR = RESULTS_DIR / "models"
+PREDICTIONS_DIR = RESULTS_DIR / "predictions"
 METRICS_PATH = RESULTS_DIR / "metrics.csv"
+THRESHOLDS_PATH = RESULTS_DIR / "thresholds.csv"
+MODEL_RANKINGS_PATH = RESULTS_DIR / "model_rankings.csv"
 
 DATASET_CSV = "diabetic_data.csv"
 IDS_MAPPING_CSV = "IDS_mapping.csv"
@@ -41,5 +44,5 @@ DROP_COLUMNS = ID_COLUMNS
 
 def ensure_directories() -> None:
     """Create project output directories if they do not exist."""
-    for path in [RAW_DATA_DIR, PROCESSED_DATA_DIR, FIGURES_DIR, MODELS_DIR]:
+    for path in [RAW_DATA_DIR, PROCESSED_DATA_DIR, FIGURES_DIR, MODELS_DIR, PREDICTIONS_DIR]:
         path.mkdir(parents=True, exist_ok=True)

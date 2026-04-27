@@ -34,14 +34,18 @@ def evaluate_binary(
     roc_auc = roc_auc_score(y_true, y_proba) if len(labels) == 2 else np.nan
     pr_auc = average_precision_score(y_true, y_proba) if len(labels) == 2 else np.nan
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
 
     return {
         "threshold": float(threshold),
         "roc_auc": float(roc_auc),
         "pr_auc": float(pr_auc),
+        "test_roc_auc": float(roc_auc),
+        "test_pr_auc": float(pr_auc),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "specificity": float(specificity),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
         "tn": int(tn),
         "fp": int(fp),
@@ -73,12 +77,12 @@ def choose_threshold_for_recall(
     y_proba: np.ndarray,
     min_recall: float = 0.8,
 ) -> float:
-    """Choose the highest-F1 threshold among thresholds meeting a recall target."""
+    """Choose the highest-precision threshold while satisfying a recall target."""
     grid = threshold_grid(y_true, y_proba)
     eligible = grid[grid["recall"] >= min_recall]
     if eligible.empty:
         return choose_threshold_max_f1(y_true, y_proba)
-    return float(eligible.sort_values(["f1", "precision"], ascending=False).iloc[0]["threshold"])
+    return float(eligible.sort_values(["precision", "f1"], ascending=False).iloc[0]["threshold"])
 
 
 def choose_threshold(
@@ -142,6 +146,54 @@ def tune_weighted_average(
     return {names[0]: best_weight, names[1]: 1.0 - best_weight}, best_proba, best_score
 
 
+def tune_weighted_average_any(
+    y_true: np.ndarray,
+    val_probabilities: dict[str, np.ndarray],
+    metric: str = "pr_auc",
+    step: float = 0.02,
+    n_random: int = 500,
+    random_state: int = 42,
+) -> tuple[dict[str, float], np.ndarray, float]:
+    """Tune weighted averages for two or more models on validation probabilities."""
+    if len(val_probabilities) < 2:
+        raise ValueError("At least two models are required for a weighted ensemble.")
+    if len(val_probabilities) == 2:
+        return tune_weighted_average(y_true, val_probabilities, metric=metric, step=step)
+
+    names = list(val_probabilities)
+    matrices = np.column_stack([np.asarray(val_probabilities[name], dtype=float) for name in names])
+    candidates: list[np.ndarray] = []
+    candidates.append(np.ones(len(names)) / len(names))
+    candidates.extend(np.eye(len(names)))
+
+    rng = np.random.default_rng(random_state)
+    alpha = np.ones(len(names))
+    candidates.extend(rng.dirichlet(alpha, size=n_random))
+
+    best_score = -np.inf
+    best_weights: np.ndarray | None = None
+    best_proba: np.ndarray | None = None
+    for weights in candidates:
+        combined = matrices @ weights
+        if metric == "pr_auc":
+            score = average_precision_score(y_true, combined)
+        elif metric == "roc_auc":
+            score = roc_auc_score(y_true, combined)
+        elif metric == "f1":
+            threshold = choose_threshold_max_f1(y_true, combined)
+            score = f1_score(y_true, combined >= threshold, zero_division=0)
+        else:
+            raise ValueError(f"Unsupported ensemble tuning metric: {metric}")
+        if score > best_score:
+            best_score = float(score)
+            best_weights = np.asarray(weights, dtype=float)
+            best_proba = combined
+
+    if best_weights is None or best_proba is None:
+        raise RuntimeError("Weighted ensemble tuning failed.")
+    return dict(zip(names, best_weights.tolist())), best_proba, best_score
+
+
 def evaluate_subgroups(
     X: pd.DataFrame,
     y_true: np.ndarray,
@@ -193,13 +245,18 @@ def metrics_row(
     y_proba: np.ndarray,
     threshold: float = 0.5,
     threshold_source: str = "fixed_0.5",
+    recall_target: float | None = None,
 ) -> dict[str, float | int | str]:
     """Create a metrics row with model/split metadata."""
     row = evaluate_binary(y_true, y_proba, threshold)
+    if split != "test":
+        row["test_roc_auc"] = np.nan
+        row["test_pr_auc"] = np.nan
     return {
         "model": model_name,
         "split": split,
         "threshold_source": threshold_source,
+        "recall_target": np.nan if recall_target is None else float(recall_target),
         **row,
     }
 

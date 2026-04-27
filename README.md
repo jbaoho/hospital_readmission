@@ -27,7 +27,15 @@ python -m pip install -r requirements.txt
 python -m src.data_download
 ```
 
-Python 3.10-3.12 is recommended. On this local macOS/Python 3.13 environment, the XGBoost wheel segfaulted during training, while the same code runs correctly in a Python 3.12 virtual environment and in Colab's Python 3.11 runtime.
+Python 3.10-3.12 is recommended. On macOS, keep native thread pools small for stability:
+
+```bash
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+```
+
+Large PyTorch batches such as `--deep-batch-size 2048` caused local native runtime/resource instability on this Mac. The runner now defaults to CPU and `--deep-batch-size 64`; use 64 or 128 locally unless you have verified that larger batches are stable.
 
 Google Colab setup:
 
@@ -60,26 +68,64 @@ Quick smoke test on a stratified subset:
 
 ```bash
 source .venv/bin/activate
-python -m src.run_experiment --sample-size 2500 --quick
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+python -X faulthandler -m src.run_experiment \
+  --sample-size 2500 \
+  --quick \
+  --device cpu \
+  --deep-batch-size 64 \
+  --modern-dl-epochs 1
 ```
 
-Full run:
+Stable local CPU run:
 
 ```bash
 source .venv/bin/activate
-python -m src.run_experiment
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+python -X faulthandler -m src.run_experiment \
+  --skip-download \
+  --min-recall 0.6 \
+  --device cpu \
+  --deep-batch-size 64 \
+  --modern-dl-epochs 1
 ```
 
-Improved full run with engineered features, tuned XGBoost, calibrated XGBoost, residual focal-loss MLP, recall-target threshold rows, and validation-weighted XGBoost+TabNet ensembling:
+Strong local experiment with tuned boosted baselines:
 
 ```bash
-python -m src.run_experiment --skip-download --tune-xgb --xgb-tune-iter 6 --min-recall 0.6 --deep-batch-size 2048
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+python -X faulthandler -m src.run_experiment \
+  --skip-download \
+  --tune-xgb \
+  --xgb-tune-iter 20 \
+  --include-lightgbm \
+  --lgbm-tune-iter 20 \
+  --include-catboost \
+  --catboost-tune-iter 20 \
+  --min-recall 0.6 \
+  --device cpu \
+  --deep-batch-size 64 \
+  --modern-dl-epochs 20
 ```
 
-If PyTorch reports Apple MPS as available, use the Mac GPU for the PyTorch models:
+Optional Apple MPS run. MPS is only used for PyTorch models, not XGBoost/LightGBM/CatBoost. If PyTorch reports MPS as available, enable fallback for unsupported ops:
 
 ```bash
-python -m src.run_experiment --skip-download --tune-xgb --xgb-tune-iter 6 --min-recall 0.6 --device mps --deep-batch-size 2048
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+python -X faulthandler -m src.run_experiment \
+  --skip-download \
+  --tune-xgb \
+  --xgb-tune-iter 6 \
+  --min-recall 0.6 \
+  --device mps \
+  --deep-batch-size 64
 ```
 
 Check MPS availability:
@@ -95,7 +141,14 @@ PY
 Patient-level split sensitivity run:
 
 ```bash
-python -m src.run_experiment --skip-download --split-strategy patient --tune-xgb --xgb-tune-iter 6 --min-recall 0.6
+python -X faulthandler -m src.run_experiment \
+  --skip-download \
+  --split-strategy patient \
+  --tune-xgb \
+  --xgb-tune-iter 6 \
+  --min-recall 0.6 \
+  --device cpu \
+  --deep-batch-size 64
 ```
 
 Optional TabNet unsupervised pretraining is implemented, but it adds runtime:
@@ -123,6 +176,8 @@ The notebooks provide the course-report workflow:
 - XGBoost with `scale_pos_weight`
 - Tuned XGBoost optimized on validation PR-AUC
 - Calibrated XGBoost using validation-set isotonic calibration
+- Optional LightGBM with `scale_pos_weight`, validation PR-AUC tuning, and `--include-lightgbm`
+- Optional CatBoost with `Logloss`, `PRAUC`, class weights, quiet training, and `--include-catboost`
 - PyTorch residual MLP with categorical embeddings, focal loss, and validation PR-AUC early stopping
 - TabNet using `pytorch-tabnet`, with optional unsupervised pretraining
 - TabTransformer implemented in PyTorch
@@ -131,6 +186,7 @@ The notebooks provide the course-report workflow:
 - TabR is documented as skipped because a faithful implementation would require a dedicated retrieval/indexing pipeline beyond this project scope
 - Validation-weighted XGBoost + TabNet ensemble
 - Validation-weighted XGBoost + TabTransformer and XGBoost + TabM ensembles
+- Validation-weighted XGBoost + LightGBM, XGBoost + CatBoost, XGBoost + LightGBM + CatBoost, XGBoost + best deep model, and all-available-model ensembles
 - Logistic-regression stacking over model probabilities
 
 ## Feature Engineering
@@ -145,7 +201,7 @@ The preprocessing pipeline adds leakage-safe row-level features before splitting
 
 ## Metrics
 
-Each model is evaluated using predicted probabilities and a validation-selected threshold:
+Each model is evaluated using predicted probabilities and a validation-selected threshold. PR-AUC is the primary ranking metric because the positive class, readmitted within 30 days, is clinically important and imbalanced.
 
 - ROC-AUC
 - PR-AUC
@@ -155,11 +211,14 @@ Each model is evaluated using predicted probabilities and a validation-selected 
 - F1 score
 - Confusion matrix
 
-The default helper also supports threshold tuning to maximize validation F1 or meet a recall target.
+The default helper supports threshold tuning to maximize validation F1 or meet a recall target. For recall-target rows, the threshold is selected on the validation set as the highest-precision threshold satisfying `recall >= --min-recall`. The test set is used only after the threshold is fixed.
 
 ## Outputs
 
 - `results/metrics.csv`: model comparison table
+- `results/thresholds.csv`: selected thresholds and threshold-specific confusion counts
+- `results/model_rankings.csv`: models sorted by test PR-AUC and precision at the recall target
+- `results/predictions/`: validation and test probabilities for each model
 - `results/figures/`: class distribution, ROC curves, PR curves, confusion matrices, feature importance, metric comparison plots
 - `results/models/`: trained model artifacts and preprocessors
 
@@ -168,4 +227,5 @@ The default helper also supports threshold tuning to maximize validation F1 or m
 - The default split is encounter-level, so the same patient may appear multiple times. Use `--split-strategy patient` for a stricter patient-disjoint sensitivity analysis.
 - Coded diagnosis fields are treated as categorical strings rather than mapped to clinical ontologies.
 - TabNet may require compatible PyTorch and CUDA versions; Colab is the recommended environment if local dependency resolution fails.
+- LightGBM and CatBoost are optional native dependencies. If either package is unavailable or fails to load on macOS, the runner logs the failure and continues with the remaining models.
 - Thresholds are selected on the validation split and should be rechecked before any clinical deployment.

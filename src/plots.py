@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.metrics import ConfusionMatrixDisplay, PrecisionRecallDisplay, RocCurveDisplay
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 from .config import FIGURES_DIR, ensure_directories
 
@@ -57,6 +58,39 @@ def plot_precision_recall_curve(y_true: np.ndarray, y_proba: np.ndarray, model_n
     fig, ax = plt.subplots(figsize=(5, 4))
     PrecisionRecallDisplay.from_predictions(y_true, y_proba, name=model_name, ax=ax)
     ax.set_title(f"Precision-Recall Curve: {model_name}")
+    return _save(fig, path)
+
+
+def plot_combined_roc_curves(
+    y_true: np.ndarray,
+    model_probabilities: dict[str, np.ndarray],
+    path: Path = FIGURES_DIR / "roc_curves_all_models.png",
+) -> Path:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for model_name, y_proba in model_probabilities.items():
+        if len(np.unique(y_true)) < 2:
+            label = model_name
+        else:
+            label = f"{model_name} (AUC={roc_auc_score(y_true, y_proba):.3f})"
+        RocCurveDisplay.from_predictions(y_true, y_proba, name=label, ax=ax)
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1)
+    ax.set_title("ROC Curves: All Models")
+    return _save(fig, path)
+
+
+def plot_combined_precision_recall_curves(
+    y_true: np.ndarray,
+    model_probabilities: dict[str, np.ndarray],
+    path: Path = FIGURES_DIR / "pr_curves_all_models.png",
+) -> Path:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for model_name, y_proba in model_probabilities.items():
+        if len(np.unique(y_true)) < 2:
+            label = model_name
+        else:
+            label = f"{model_name} (AP={average_precision_score(y_true, y_proba):.3f})"
+        PrecisionRecallDisplay.from_predictions(y_true, y_proba, name=label, ax=ax)
+    ax.set_title("Precision-Recall Curves: All Models")
     return _save(fig, path)
 
 

@@ -268,7 +268,7 @@ def train_mlp(
     prepared,
     model_dir: Path = MODELS_DIR,
     epochs: int = 30,
-    batch_size: int = 512,
+    batch_size: int = 64,
     learning_rate: float = 1e-3,
     patience: int = 5,
     device: str | None = None,
@@ -286,11 +286,13 @@ def train_mlp(
         TabularDataset(prepared.X_cat_train, prepared.X_num_train, prepared.y_train),
         batch_size=batch_size,
         shuffle=True,
+        num_workers=0,
     )
     val_loader = DataLoader(
         TabularDataset(prepared.X_cat_val, prepared.X_num_val, prepared.y_val),
         batch_size=batch_size,
         shuffle=False,
+        num_workers=0,
     )
 
     if architecture == "residual":
@@ -383,7 +385,7 @@ def predict_mlp(
     model: MLPClassifier,
     X_cat: np.ndarray,
     X_num: np.ndarray,
-    batch_size: int = 1024,
+    batch_size: int = 64,
     device: str | None = None,
 ) -> np.ndarray:
     """Return MLP positive-class probabilities."""
@@ -391,7 +393,7 @@ def predict_mlp(
     model = model.to(device)
     model.eval()
     dummy_y = np.zeros(len(X_cat), dtype=np.float32)
-    loader = DataLoader(TabularDataset(X_cat, X_num, dummy_y), batch_size=batch_size, shuffle=False)
+    loader = DataLoader(TabularDataset(X_cat, X_num, dummy_y), batch_size=batch_size, shuffle=False, num_workers=0)
     probabilities: list[np.ndarray] = []
     with torch.no_grad():
         for batch_cat, batch_num, _ in loader:
@@ -405,6 +407,7 @@ def train_tabnet(
     model_dir: Path = MODELS_DIR,
     quick: bool = False,
     use_pretraining: bool = False,
+    batch_size: int = 64,
 ):
     """Train pytorch-tabnet if installed."""
     try:
@@ -445,8 +448,8 @@ def train_tabnet(
                 eval_set=[X_val],
                 max_epochs=10 if quick else 40,
                 patience=3 if quick else 8,
-                batch_size=1024,
-                virtual_batch_size=128,
+                batch_size=batch_size,
+                virtual_batch_size=min(32, batch_size),
                 num_workers=0,
                 drop_last=False,
                 pretraining_ratio=0.8,
@@ -471,8 +474,8 @@ def train_tabnet(
         weights=sample_weights,
         max_epochs=5 if quick else 50,
         patience=3 if quick else 10,
-        batch_size=1024,
-        virtual_batch_size=128,
+        batch_size=batch_size,
+        virtual_batch_size=min(32, batch_size),
         num_workers=0,
         drop_last=False,
         **fit_kwargs,

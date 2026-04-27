@@ -8,9 +8,19 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.metrics import average_precision_score
 from sklearn.linear_model import LogisticRegression
 
-from .config import FIGURES_DIR, METRICS_PATH, MODELS_DIR, RESULTS_DIR, ensure_directories
+from .config import (
+    FIGURES_DIR,
+    METRICS_PATH,
+    MODEL_RANKINGS_PATH,
+    MODELS_DIR,
+    PREDICTIONS_DIR,
+    RESULTS_DIR,
+    THRESHOLDS_PATH,
+    ensure_directories,
+)
 from .data_download import download_dataset
 from .evaluate import (
     calibrate_probabilities_isotonic,
@@ -18,10 +28,12 @@ from .evaluate import (
     evaluate_subgroups,
     metrics_row,
     save_metrics,
-    tune_weighted_average,
+    tune_weighted_average_any,
 )
 from .plots import (
     plot_class_distribution,
+    plot_combined_precision_recall_curves,
+    plot_combined_roc_curves,
     plot_confusion_matrix,
     plot_metric_comparison,
     plot_precision_recall_curve,
@@ -30,8 +42,30 @@ from .plots import (
     plot_xgboost_feature_importance,
 )
 from .preprocessing import fit_transform_deep, fit_transform_sklearn, prepare_splits
-from .train_baselines import predict_proba, train_logistic_regression, train_xgboost, tune_xgboost
+from .train_baselines import (
+    predict_proba,
+    train_catboost,
+    train_lightgbm,
+    train_logistic_regression,
+    train_xgboost,
+    tune_catboost,
+    tune_lightgbm,
+    tune_xgboost,
+)
 from .train_deep import predict_mlp, predict_tabnet, train_mlp, train_tabnet
+
+
+def _slug(name: str) -> str:
+    return (
+        name.lower()
+        .replace("+", "_plus_")
+        .replace("/", "_")
+        .replace(" ", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("=", "")
+        .replace(".", "_")
+    )
 
 
 def _add_threshold_rows(
@@ -46,7 +80,7 @@ def _add_threshold_rows(
     include_recall_target: bool,
 ) -> float:
     threshold, source = choose_threshold(y_val, val_proba, threshold_strategy, min_recall)
-    rows.append(metrics_row(model_name, "test", y_test, test_proba, threshold, source))
+    rows.append(metrics_row(model_name, "test", y_test, test_proba, threshold, source, min_recall))
 
     if include_recall_target and threshold_strategy != "recall_target":
         recall_threshold, recall_source = choose_threshold(y_val, val_proba, "recall_target", min_recall)
@@ -58,9 +92,145 @@ def _add_threshold_rows(
                 test_proba,
                 recall_threshold,
                 recall_source,
+                min_recall,
             )
         )
     return threshold
+
+
+def _save_prediction_files(
+    y_val: np.ndarray,
+    y_test: np.ndarray,
+    val_probabilities: dict[str, np.ndarray],
+    test_probabilities: dict[str, np.ndarray],
+) -> None:
+    """Persist model probabilities for reproducible reporting and ensembling checks."""
+    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    for model_name, y_proba in val_probabilities.items():
+        pd.DataFrame({"y_true": y_val, "y_proba": y_proba}).to_csv(
+            PREDICTIONS_DIR / f"{_slug(model_name)}_val_predictions.csv",
+            index=False,
+        )
+    for model_name, y_proba in test_probabilities.items():
+        pd.DataFrame({"y_true": y_test, "y_proba": y_proba}).to_csv(
+            PREDICTIONS_DIR / f"{_slug(model_name)}_test_predictions.csv",
+            index=False,
+        )
+
+
+def _save_thresholds(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "model",
+        "split",
+        "threshold_source",
+        "recall_target",
+        "threshold",
+        "precision",
+        "recall",
+        "specificity",
+        "f1",
+        "tn",
+        "fp",
+        "fn",
+        "tp",
+    ]
+    thresholds_df = metrics_df[[col for col in columns if col in metrics_df.columns]].copy()
+    thresholds_df.to_csv(THRESHOLDS_PATH, index=False)
+    return thresholds_df
+
+
+def _save_model_rankings(metrics_df: pd.DataFrame, min_recall: float) -> pd.DataFrame:
+    test_df = metrics_df[metrics_df["split"] == "test"].copy()
+    if test_df.empty:
+        rankings = pd.DataFrame()
+        rankings.to_csv(MODEL_RANKINGS_PATH, index=False)
+        return rankings
+
+    by_pr_auc = test_df.sort_values(["test_pr_auc", "recall"], ascending=False).copy()
+    by_pr_auc["ranking"] = "test_pr_auc"
+    by_pr_auc["rank"] = np.arange(1, len(by_pr_auc) + 1)
+
+    recall_target_df = test_df[test_df["recall"] >= min_recall].copy()
+    recall_target_df = recall_target_df.sort_values(["precision", "test_pr_auc"], ascending=False)
+    recall_target_df["ranking"] = f"precision_at_recall_{min_recall:g}"
+    recall_target_df["rank"] = np.arange(1, len(recall_target_df) + 1)
+
+    rankings = pd.concat([by_pr_auc, recall_target_df], ignore_index=True)
+    rankings.to_csv(MODEL_RANKINGS_PATH, index=False)
+    return rankings
+
+
+def _probability_key_for_metrics_model(model_name: str, available: dict[str, np.ndarray]) -> str | None:
+    cleaned = model_name.replace(" (recall target)", "")
+    if cleaned in available:
+        return cleaned
+    prefixes = {
+        "XGBoost Tuned Calibrated": "XGBoost Calibrated",
+        "XGBoost Calibrated": "XGBoost Calibrated",
+        "XGBoost Tuned": "XGBoost",
+        "XGBoost": "XGBoost",
+        "LightGBM Tuned": "LightGBM",
+        "LightGBM": "LightGBM",
+        "CatBoost Tuned": "CatBoost",
+        "CatBoost": "CatBoost",
+        "Residual MLP Focal": "MLP",
+        "TabM-Style Ensemble MLP": "TabM",
+        "TabTransformer": "TabTransformer",
+        "TabNet Pretrained": "TabNet",
+        "TabNet": "TabNet",
+    }
+    for prefix, key in prefixes.items():
+        if cleaned.startswith(prefix) and key in available:
+            return key
+    if cleaned.startswith("Weighted "):
+        key = cleaned.removeprefix("Weighted ").removesuffix(" Ensemble")
+        if key in available:
+            return key
+    if cleaned.startswith("Stacking") and "Stacking" in available:
+        return "Stacking"
+    return None
+
+
+def _add_weighted_ensemble(
+    rows: list[dict],
+    val_probabilities: dict[str, np.ndarray],
+    test_probabilities: dict[str, np.ndarray],
+    thresholds: dict[str, float],
+    key: str,
+    model_names: list[str],
+    y_val: np.ndarray,
+    y_test: np.ndarray,
+    threshold_strategy: str,
+    min_recall: float,
+    include_recall_target: bool,
+    quick: bool = False,
+) -> None:
+    if key in val_probabilities or any(name not in val_probabilities or name not in test_probabilities for name in model_names):
+        return
+    weights, val_ensemble, ensemble_score = tune_weighted_average_any(
+        y_val,
+        {name: val_probabilities[name] for name in model_names},
+        metric="pr_auc",
+        step=0.02,
+        n_random=100 if quick else 500,
+    )
+    test_ensemble = np.zeros_like(next(iter(test_probabilities.values())), dtype=float)
+    for name, weight in weights.items():
+        test_ensemble += weight * test_probabilities[name]
+    val_probabilities[key] = val_ensemble
+    test_probabilities[key] = test_ensemble
+    print(f"{key}_val_pr_auc={ensemble_score:.5f} weights={weights}")
+    thresholds[key] = _add_threshold_rows(
+        rows,
+        f"Weighted {key} Ensemble",
+        y_val,
+        val_ensemble,
+        y_test,
+        test_ensemble,
+        threshold_strategy,
+        min_recall,
+        include_recall_target,
+    )
 
 
 def run_experiment(
@@ -72,6 +242,10 @@ def run_experiment(
     tune_xgb: bool = False,
     xgb_tune_iter: int = 20,
     xgb_n_jobs: int = -1,
+    include_lightgbm: bool = False,
+    lgbm_tune_iter: int = 0,
+    include_catboost: bool = False,
+    catboost_tune_iter: int = 0,
     calibrate_xgb: bool = True,
     threshold_strategy: str = "max_f1",
     min_recall: float = 0.6,
@@ -81,7 +255,7 @@ def run_experiment(
     skip_stacking: bool = False,
     torch_device: str | None = None,
     modern_dl_epochs: int | None = None,
-    deep_batch_size: int = 1024,
+    deep_batch_size: int = 64,
 ) -> pd.DataFrame:
     """Run all available models and save metrics/figures."""
     ensure_directories()
@@ -182,87 +356,189 @@ def run_experiment(
     except Exception as exc:
         print(f"XGBoost skipped/failed: {exc}")
 
+    if include_lightgbm:
+        try:
+            if lgbm_tune_iter > 0:
+                lgbm, _ = tune_lightgbm(
+                    sklearn_data.X_train,
+                    sklearn_data.y_train,
+                    sklearn_data.X_val,
+                    sklearn_data.y_val,
+                    n_iter=2 if quick else lgbm_tune_iter,
+                )
+                lgbm_name = "LightGBM Tuned"
+            else:
+                lgbm = train_lightgbm(
+                    sklearn_data.X_train,
+                    sklearn_data.y_train,
+                    sklearn_data.X_val,
+                    sklearn_data.y_val,
+                    quick=quick,
+                )
+                lgbm_name = "LightGBM"
+            val_probabilities["LightGBM"] = predict_proba(lgbm, sklearn_data.X_val)
+            test_probabilities["LightGBM"] = predict_proba(lgbm, sklearn_data.X_test)
+            thresholds["LightGBM"] = _add_threshold_rows(
+                rows,
+                lgbm_name,
+                sklearn_data.y_val,
+                val_probabilities["LightGBM"],
+                sklearn_data.y_test,
+                test_probabilities["LightGBM"],
+                threshold_strategy,
+                min_recall,
+                include_recall_target,
+            )
+        except Exception as exc:
+            print(f"LightGBM skipped/failed: {exc}")
+
+    if include_catboost:
+        try:
+            if catboost_tune_iter > 0:
+                catboost, _ = tune_catboost(
+                    sklearn_data.X_train,
+                    sklearn_data.y_train,
+                    sklearn_data.X_val,
+                    sklearn_data.y_val,
+                    n_iter=2 if quick else catboost_tune_iter,
+                )
+                catboost_name = "CatBoost Tuned"
+            else:
+                catboost = train_catboost(
+                    sklearn_data.X_train,
+                    sklearn_data.y_train,
+                    sklearn_data.X_val,
+                    sklearn_data.y_val,
+                    quick=quick,
+                )
+                catboost_name = "CatBoost"
+            val_probabilities["CatBoost"] = predict_proba(catboost, sklearn_data.X_val)
+            test_probabilities["CatBoost"] = predict_proba(catboost, sklearn_data.X_test)
+            thresholds["CatBoost"] = _add_threshold_rows(
+                rows,
+                catboost_name,
+                sklearn_data.y_val,
+                val_probabilities["CatBoost"],
+                sklearn_data.y_test,
+                test_probabilities["CatBoost"],
+                threshold_strategy,
+                min_recall,
+                include_recall_target,
+            )
+        except Exception as exc:
+            print(f"CatBoost skipped/failed: {exc}")
+
     deep_data = fit_transform_deep(split)
     joblib.dump(deep_data, MODELS_DIR / "deep_preprocessing.joblib")
 
-    mlp, _ = train_mlp(
-        deep_data,
-        epochs=3 if quick else 30,
-        patience=2 if quick else 5,
-        batch_size=deep_batch_size,
-        device=torch_device,
-    )
-    val_probabilities["MLP"] = predict_mlp(mlp, deep_data.X_cat_val, deep_data.X_num_val)
-    test_probabilities["MLP"] = predict_mlp(mlp, deep_data.X_cat_test, deep_data.X_num_test)
-    thresholds["MLP"] = _add_threshold_rows(
-        rows,
-        "Residual MLP Focal",
-        deep_data.y_val,
-        val_probabilities["MLP"],
-        deep_data.y_test,
-        test_probabilities["MLP"],
-        threshold_strategy,
-        min_recall,
-        include_recall_target,
-    )
+    try:
+        mlp, _ = train_mlp(
+            deep_data,
+            epochs=3 if quick else 30,
+            patience=2 if quick else 5,
+            batch_size=deep_batch_size,
+            device=torch_device,
+        )
+        val_probabilities["MLP"] = predict_mlp(
+            mlp, deep_data.X_cat_val, deep_data.X_num_val, batch_size=deep_batch_size, device=torch_device
+        )
+        test_probabilities["MLP"] = predict_mlp(
+            mlp, deep_data.X_cat_test, deep_data.X_num_test, batch_size=deep_batch_size, device=torch_device
+        )
+        thresholds["MLP"] = _add_threshold_rows(
+            rows,
+            "Residual MLP Focal",
+            deep_data.y_val,
+            val_probabilities["MLP"],
+            deep_data.y_test,
+            test_probabilities["MLP"],
+            threshold_strategy,
+            min_recall,
+            include_recall_target,
+        )
+    except Exception as exc:
+        print(f"MLP skipped/failed: {exc}")
 
     if not skip_modern_dl:
         model_epochs = modern_dl_epochs if modern_dl_epochs is not None else (3 if quick else 8)
-        tabtransformer, _ = train_mlp(
-            deep_data,
-            epochs=model_epochs,
-            patience=2 if quick else 5,
-            batch_size=deep_batch_size,
-            device=torch_device,
-            architecture="tabtransformer",
-            loss_name="focal",
-            model_name="tabtransformer",
-        )
-        val_probabilities["TabTransformer"] = predict_mlp(
-            tabtransformer, deep_data.X_cat_val, deep_data.X_num_val
-        )
-        test_probabilities["TabTransformer"] = predict_mlp(
-            tabtransformer, deep_data.X_cat_test, deep_data.X_num_test
-        )
-        thresholds["TabTransformer"] = _add_threshold_rows(
-            rows,
-            "TabTransformer",
-            deep_data.y_val,
-            val_probabilities["TabTransformer"],
-            deep_data.y_test,
-            test_probabilities["TabTransformer"],
-            threshold_strategy,
-            min_recall,
-            include_recall_target,
-        )
+        try:
+            tabtransformer, _ = train_mlp(
+                deep_data,
+                epochs=model_epochs,
+                patience=2 if quick else 5,
+                batch_size=deep_batch_size,
+                device=torch_device,
+                architecture="tabtransformer",
+                loss_name="focal",
+                model_name="tabtransformer",
+            )
+            val_probabilities["TabTransformer"] = predict_mlp(
+                tabtransformer,
+                deep_data.X_cat_val,
+                deep_data.X_num_val,
+                batch_size=deep_batch_size,
+                device=torch_device,
+            )
+            test_probabilities["TabTransformer"] = predict_mlp(
+                tabtransformer,
+                deep_data.X_cat_test,
+                deep_data.X_num_test,
+                batch_size=deep_batch_size,
+                device=torch_device,
+            )
+            thresholds["TabTransformer"] = _add_threshold_rows(
+                rows,
+                "TabTransformer",
+                deep_data.y_val,
+                val_probabilities["TabTransformer"],
+                deep_data.y_test,
+                test_probabilities["TabTransformer"],
+                threshold_strategy,
+                min_recall,
+                include_recall_target,
+            )
+        except Exception as exc:
+            print(f"TabTransformer skipped/failed: {exc}")
 
-        tabm, _ = train_mlp(
-            deep_data,
-            epochs=model_epochs,
-            patience=2 if quick else 5,
-            batch_size=deep_batch_size,
-            device=torch_device,
-            architecture="tabm",
-            loss_name="focal",
-            model_name="tabm",
-        )
-        val_probabilities["TabM"] = predict_mlp(tabm, deep_data.X_cat_val, deep_data.X_num_val)
-        test_probabilities["TabM"] = predict_mlp(tabm, deep_data.X_cat_test, deep_data.X_num_test)
-        thresholds["TabM"] = _add_threshold_rows(
-            rows,
-            "TabM-Style Ensemble MLP",
-            deep_data.y_val,
-            val_probabilities["TabM"],
-            deep_data.y_test,
-            test_probabilities["TabM"],
-            threshold_strategy,
-            min_recall,
-            include_recall_target,
-        )
+        try:
+            tabm, _ = train_mlp(
+                deep_data,
+                epochs=model_epochs,
+                patience=2 if quick else 5,
+                batch_size=deep_batch_size,
+                device=torch_device,
+                architecture="tabm",
+                loss_name="focal",
+                model_name="tabm",
+            )
+            val_probabilities["TabM"] = predict_mlp(
+                tabm, deep_data.X_cat_val, deep_data.X_num_val, batch_size=deep_batch_size, device=torch_device
+            )
+            test_probabilities["TabM"] = predict_mlp(
+                tabm, deep_data.X_cat_test, deep_data.X_num_test, batch_size=deep_batch_size, device=torch_device
+            )
+            thresholds["TabM"] = _add_threshold_rows(
+                rows,
+                "TabM-Style Ensemble MLP",
+                deep_data.y_val,
+                val_probabilities["TabM"],
+                deep_data.y_test,
+                test_probabilities["TabM"],
+                threshold_strategy,
+                min_recall,
+                include_recall_target,
+            )
+        except Exception as exc:
+            print(f"TabM skipped/failed: {exc}")
 
     if not skip_tabnet:
         try:
-            tabnet = train_tabnet(deep_data, quick=quick, use_pretraining=use_tabnet_pretraining and not quick)
+            tabnet = train_tabnet(
+                deep_data,
+                quick=quick,
+                use_pretraining=use_tabnet_pretraining and not quick,
+                batch_size=deep_batch_size,
+            )
             val_probabilities["TabNet"] = predict_tabnet(tabnet, deep_data.X_cat_val, deep_data.X_num_val)
             test_probabilities["TabNet"] = predict_tabnet(tabnet, deep_data.X_cat_test, deep_data.X_num_test)
             tabnet_name = "TabNet Pretrained" if use_tabnet_pretraining and not quick else "TabNet"
@@ -280,64 +556,133 @@ def run_experiment(
         except Exception as exc:
             print(f"TabNet skipped/failed: {exc}")
 
-    if "XGBoost" in test_probabilities and "TabNet" in test_probabilities:
-        weights, val_ensemble, ensemble_score = tune_weighted_average(
-            sklearn_data.y_val,
-            {"XGBoost": val_probabilities["XGBoost"], "TabNet": val_probabilities["TabNet"]},
-            metric="pr_auc",
-            step=0.02,
-        )
-        test_ensemble = weights["XGBoost"] * test_probabilities["XGBoost"] + weights["TabNet"] * test_probabilities[
-            "TabNet"
-        ]
-        test_probabilities["Weighted Ensemble"] = test_ensemble
-        ensemble_name = f"Weighted XGBoost+TabNet Ensemble (xgb={weights['XGBoost']:.2f})"
-        print(f"weighted_ensemble_val_pr_auc={ensemble_score:.5f} weights={weights}")
-        thresholds["Weighted Ensemble"] = _add_threshold_rows(
+    _add_weighted_ensemble(
+        rows,
+        val_probabilities,
+        test_probabilities,
+        thresholds,
+        "XGBoost+TabNet",
+        ["XGBoost", "TabNet"],
+        sklearn_data.y_val,
+        sklearn_data.y_test,
+        threshold_strategy,
+        min_recall,
+        include_recall_target,
+        quick,
+    )
+    _add_weighted_ensemble(
+        rows,
+        val_probabilities,
+        test_probabilities,
+        thresholds,
+        "XGBoost+LightGBM",
+        ["XGBoost", "LightGBM"],
+        sklearn_data.y_val,
+        sklearn_data.y_test,
+        threshold_strategy,
+        min_recall,
+        include_recall_target,
+        quick,
+    )
+    _add_weighted_ensemble(
+        rows,
+        val_probabilities,
+        test_probabilities,
+        thresholds,
+        "XGBoost+CatBoost",
+        ["XGBoost", "CatBoost"],
+        sklearn_data.y_val,
+        sklearn_data.y_test,
+        threshold_strategy,
+        min_recall,
+        include_recall_target,
+        quick,
+    )
+    _add_weighted_ensemble(
+        rows,
+        val_probabilities,
+        test_probabilities,
+        thresholds,
+        "XGBoost+LightGBM+CatBoost",
+        ["XGBoost", "LightGBM", "CatBoost"],
+        sklearn_data.y_val,
+        sklearn_data.y_test,
+        threshold_strategy,
+        min_recall,
+        include_recall_target,
+        quick,
+    )
+
+    for deep_name in ["TabTransformer", "TabM"]:
+        _add_weighted_ensemble(
             rows,
-            ensemble_name,
+            val_probabilities,
+            test_probabilities,
+            thresholds,
+            f"XGBoost+{deep_name}",
+            ["XGBoost", deep_name],
             sklearn_data.y_val,
-            val_ensemble,
             sklearn_data.y_test,
-            test_ensemble,
             threshold_strategy,
             min_recall,
             include_recall_target,
+            quick,
         )
 
-    for deep_name in ["TabTransformer", "TabM"]:
-        if "XGBoost" in test_probabilities and deep_name in test_probabilities:
-            weights, val_ensemble, ensemble_score = tune_weighted_average(
-                sklearn_data.y_val,
-                {"XGBoost": val_probabilities["XGBoost"], deep_name: val_probabilities[deep_name]},
-                metric="pr_auc",
-                step=0.02,
-            )
-            test_ensemble = (
-                weights["XGBoost"] * test_probabilities["XGBoost"]
-                + weights[deep_name] * test_probabilities[deep_name]
-            )
-            key = f"Weighted XGBoost+{deep_name}"
-            test_probabilities[key] = test_ensemble
-            print(f"{key}_val_pr_auc={ensemble_score:.5f} weights={weights}")
-            thresholds[key] = _add_threshold_rows(
-                rows,
-                f"Weighted XGBoost+{deep_name} Ensemble (xgb={weights['XGBoost']:.2f})",
-                sklearn_data.y_val,
-                val_ensemble,
-                sklearn_data.y_test,
-                test_ensemble,
-                threshold_strategy,
-                min_recall,
-                include_recall_target,
-            )
+    deep_candidates = [name for name in ["MLP", "TabNet", "TabTransformer", "TabM"] if name in val_probabilities]
+    if "XGBoost" in val_probabilities and deep_candidates:
+        best_deep = max(
+            deep_candidates,
+            key=lambda name: average_precision_score(sklearn_data.y_val, val_probabilities[name]),
+        )
+        _add_weighted_ensemble(
+            rows,
+            val_probabilities,
+            test_probabilities,
+            thresholds,
+            f"XGBoost+BestDeep({best_deep})",
+            ["XGBoost", best_deep],
+            sklearn_data.y_val,
+            sklearn_data.y_test,
+            threshold_strategy,
+            min_recall,
+            include_recall_target,
+            quick,
+        )
+
+    base_ensemble_candidates = [
+        name
+        for name in [
+            "Logistic Regression",
+            "XGBoost",
+            "XGBoost Calibrated",
+            "LightGBM",
+            "CatBoost",
+            "MLP",
+            "TabNet",
+            "TabTransformer",
+            "TabM",
+        ]
+        if name in val_probabilities and name in test_probabilities
+    ]
+    if len(base_ensemble_candidates) >= 2:
+        _add_weighted_ensemble(
+            rows,
+            val_probabilities,
+            test_probabilities,
+            thresholds,
+            "AllAvailableModels",
+            base_ensemble_candidates,
+            sklearn_data.y_val,
+            sklearn_data.y_test,
+            threshold_strategy,
+            min_recall,
+            include_recall_target,
+            quick,
+        )
 
     if not skip_stacking and "XGBoost" in val_probabilities:
-        stack_names = [
-            name
-            for name in ["XGBoost", "TabNet", "TabTransformer", "TabM", "MLP"]
-            if name in val_probabilities and name in test_probabilities
-        ]
+        stack_names = base_ensemble_candidates
         if len(stack_names) >= 2:
             X_stack_val = np.column_stack([val_probabilities[name] for name in stack_names])
             X_stack_test = np.column_stack([test_probabilities[name] for name in stack_names])
@@ -359,6 +704,9 @@ def run_experiment(
             )
 
     metrics_df = save_metrics(rows, METRICS_PATH, append=False)
+    _save_prediction_files(sklearn_data.y_val, sklearn_data.y_test, val_probabilities, test_probabilities)
+    _save_thresholds(metrics_df)
+    rankings_df = _save_model_rankings(metrics_df, min_recall)
 
     fairness_frames = []
     for model_name, y_proba in test_probabilities.items():
@@ -378,16 +726,17 @@ def run_experiment(
         fairness_df.to_csv(RESULTS_DIR / f"fairness_{split_strategy}.csv", index=False)
 
     for model_name, y_proba in test_probabilities.items():
-        stem = model_name.lower().replace(" ", "_")
+        stem = _slug(model_name)
         plot_roc_curve(sklearn_data.y_test, y_proba, model_name, FIGURES_DIR / f"{stem}_roc.png")
         plot_precision_recall_curve(sklearn_data.y_test, y_proba, model_name, FIGURES_DIR / f"{stem}_pr.png")
-        plot_confusion_matrix(
-            sklearn_data.y_test,
-            y_proba,
-            model_name,
-            thresholds[model_name],
-            FIGURES_DIR / f"{stem}_confusion_matrix.png",
-        )
+        if model_name in thresholds:
+            plot_confusion_matrix(
+                sklearn_data.y_test,
+                y_proba,
+                model_name,
+                thresholds[model_name],
+                FIGURES_DIR / f"{stem}_confusion_matrix.png",
+            )
         plot_recall_threshold_curve(
             sklearn_data.y_test,
             y_proba,
@@ -397,8 +746,43 @@ def run_experiment(
 
     if not metrics_df.empty:
         plot_metric_comparison(metrics_df, "pr_auc", "test", FIGURES_DIR / "pr_auc_comparison.png")
+        plot_metric_comparison(metrics_df, "test_pr_auc", "test", FIGURES_DIR / "test_pr_auc_comparison.png")
         plot_metric_comparison(metrics_df, "recall", "test", FIGURES_DIR / "recall_comparison.png")
         plot_metric_comparison(metrics_df, "roc_auc", "test", FIGURES_DIR / "roc_auc_comparison.png")
+        plot_combined_precision_recall_curves(
+            sklearn_data.y_test,
+            test_probabilities,
+            FIGURES_DIR / "pr_curves_all_models.png",
+        )
+        plot_combined_roc_curves(
+            sklearn_data.y_test,
+            test_probabilities,
+            FIGURES_DIR / "roc_curves_all_models.png",
+        )
+
+    recall_rows = metrics_df[
+        (metrics_df["split"] == "test")
+        & (metrics_df["threshold_source"].astype(str).str.startswith("val_recall"))
+    ].sort_values("test_pr_auc", ascending=False)
+    for _, row in recall_rows.head(3).iterrows():
+        key = _probability_key_for_metrics_model(str(row["model"]), test_probabilities)
+        if key is None:
+            continue
+        plot_confusion_matrix(
+            sklearn_data.y_test,
+            test_probabilities[key],
+            str(row["model"]),
+            float(row["threshold"]),
+            FIGURES_DIR / f"top_recall_target_{_slug(str(row['model']))}_confusion_matrix.png",
+        )
+
+    if not rankings_df.empty:
+        print("Top models by test PR-AUC:")
+        print(
+            rankings_df[rankings_df["ranking"] == "test_pr_auc"]
+            .head(10)[["rank", "model", "test_pr_auc", "test_roc_auc", "precision", "recall", "f1"]]
+            .to_string(index=False)
+        )
 
     return metrics_df
 
@@ -413,6 +797,10 @@ def main() -> None:
     parser.add_argument("--tune-xgb", action="store_true", help="Tune XGBoost on validation PR-AUC.")
     parser.add_argument("--xgb-tune-iter", type=int, default=20)
     parser.add_argument("--xgb-n-jobs", type=int, default=-1)
+    parser.add_argument("--include-lightgbm", action="store_true", help="Train optional LightGBM baseline.")
+    parser.add_argument("--lgbm-tune-iter", type=int, default=0, help="LightGBM validation random-search iterations.")
+    parser.add_argument("--include-catboost", action="store_true", help="Train optional CatBoost baseline.")
+    parser.add_argument("--catboost-tune-iter", type=int, default=0, help="CatBoost validation random-search iterations.")
     parser.add_argument("--no-calibrate-xgb", action="store_true")
     parser.add_argument("--threshold-strategy", choices=["max_f1", "recall_target", "fixed_0.5"], default="max_f1")
     parser.add_argument("--min-recall", type=float, default=0.6)
@@ -420,9 +808,9 @@ def main() -> None:
     parser.add_argument("--tabnet-pretraining", action="store_true")
     parser.add_argument("--split-strategy", choices=["encounter", "patient"], default="encounter")
     parser.add_argument("--skip-stacking", action="store_true")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="cpu")
     parser.add_argument("--modern-dl-epochs", type=int, default=None)
-    parser.add_argument("--deep-batch-size", type=int, default=1024)
+    parser.add_argument("--deep-batch-size", type=int, default=64)
     args = parser.parse_args()
 
     metrics_df = run_experiment(
@@ -434,6 +822,10 @@ def main() -> None:
         tune_xgb=args.tune_xgb,
         xgb_tune_iter=args.xgb_tune_iter,
         xgb_n_jobs=args.xgb_n_jobs,
+        include_lightgbm=args.include_lightgbm,
+        lgbm_tune_iter=args.lgbm_tune_iter,
+        include_catboost=args.include_catboost,
+        catboost_tune_iter=args.catboost_tune_iter,
         calibrate_xgb=not args.no_calibrate_xgb,
         threshold_strategy=args.threshold_strategy,
         min_recall=args.min_recall,

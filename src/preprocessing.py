@@ -22,6 +22,7 @@ from .config import (
     RAW_DATA_DIR,
     TARGET_COLUMN,
 )
+from .feature_engineering import fit_feature_engineering_spec, transform_with_feature_engineering_spec
 
 
 MEDICATION_COLUMNS = [
@@ -343,6 +344,7 @@ def prepare_splits(
     random_state: int = RANDOM_STATE,
     missing_threshold: float = 0.4,
     split_strategy: str = "encounter",
+    advanced_feature_engineering: bool = True,
 ) -> SplitData:
     """Load raw data, clean it, optionally sample rows, and split."""
     raw = load_raw_csv(csv_path)
@@ -359,12 +361,25 @@ def prepare_splits(
         cleaned = cleaned.reset_index(drop=True)
 
     if split_strategy == "patient":
-        return create_patient_level_splits(cleaned, random_state=random_state)
-    if split_strategy != "encounter":
+        split = create_patient_level_splits(cleaned, random_state=random_state)
+    elif split_strategy == "encounter":
+        X, y = separate_features_target(cleaned)
+        split = create_splits(X, y, random_state=random_state)
+    else:
         raise ValueError("split_strategy must be either 'encounter' or 'patient'.")
 
-    X, y = separate_features_target(cleaned)
-    return create_splits(X, y, random_state=random_state)
+    if not advanced_feature_engineering:
+        return split
+
+    spec = fit_feature_engineering_spec(split.X_train, split.y_train)
+    return SplitData(
+        X_train=transform_with_feature_engineering_spec(split.X_train, spec),
+        X_val=transform_with_feature_engineering_spec(split.X_val, spec),
+        X_test=transform_with_feature_engineering_spec(split.X_test, spec),
+        y_train=split.y_train,
+        y_val=split.y_val,
+        y_test=split.y_test,
+    )
 
 
 def build_sklearn_preprocessor(

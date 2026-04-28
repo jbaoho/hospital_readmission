@@ -245,18 +245,24 @@ def metrics_row(
     y_proba: np.ndarray,
     threshold: float = 0.5,
     threshold_source: str = "fixed_0.5",
-    recall_target: float | None = None,
-) -> dict[str, float | int | str]:
+    min_recall: float | None = None,
+    is_recall_target: bool | None = None,
+    runtime_seconds: float | None = None,
+) -> dict[str, float | int | str | bool]:
     """Create a metrics row with model/split metadata."""
     row = evaluate_binary(y_true, y_proba, threshold)
     if split != "test":
         row["test_roc_auc"] = np.nan
         row["test_pr_auc"] = np.nan
+    if is_recall_target is None:
+        is_recall_target = threshold_source.startswith("val_recall")
     return {
         "model": model_name,
         "split": split,
         "threshold_source": threshold_source,
-        "recall_target": np.nan if recall_target is None else float(recall_target),
+        "recall_target": bool(is_recall_target),
+        "min_recall": np.nan if min_recall is None else float(min_recall),
+        "runtime_seconds": np.nan if runtime_seconds is None else float(runtime_seconds),
         **row,
     }
 

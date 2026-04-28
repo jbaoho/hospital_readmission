@@ -27,6 +27,13 @@ python -m pip install -r requirements.txt
 python -m src.data_download
 ```
 
+LightGBM and CatBoost are included in `requirements.txt`. If an environment was created before they were added, install them explicitly:
+
+```bash
+python -m pip install lightgbm catboost
+python -c "import lightgbm, catboost; print('boosting extras ok')"
+```
+
 Python 3.10-3.12 is recommended. On macOS, keep native thread pools small for stability:
 
 ```bash
@@ -115,9 +122,12 @@ python -X faulthandler -m src.run_experiment \
   --modern-dl-epochs 20
 ```
 
+The runner logs and skips LightGBM or CatBoost if either optional native package is unavailable. Use the explicit install command above before running `--include-lightgbm` or `--include-catboost`.
+
 Optional Apple MPS run. MPS is only used for PyTorch models, not XGBoost/LightGBM/CatBoost. If PyTorch reports MPS as available, enable fallback for unsupported ops:
 
 ```bash
+source .venv312/bin/activate
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 python -X faulthandler -m src.run_experiment \
   --skip-download \
@@ -137,6 +147,24 @@ print(torch.backends.mps.is_built())
 print(torch.backends.mps.is_available())
 PY
 ```
+
+Benchmark CPU vs the available GPU backend for deep models only:
+
+```bash
+source .venv312/bin/activate
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+
+python -X faulthandler -m src.run_experiment \
+  --skip-download \
+  --benchmark-device \
+  --sample-size 2000 \
+  --quick \
+  --device mps \
+  --deep-batch-size 128 \
+  --modern-dl-epochs 1
+```
+
+The benchmark writes CPU/GPU rows to `results/metrics.csv` with `runtime_seconds`, `test_pr_auc`, and `device`.
 
 Patient-level split sensitivity run:
 
@@ -187,7 +215,8 @@ The notebooks provide the course-report workflow:
 - Validation-weighted XGBoost + TabNet ensemble
 - Validation-weighted XGBoost + TabTransformer and XGBoost + TabM ensembles
 - Validation-weighted XGBoost + LightGBM, XGBoost + CatBoost, XGBoost + LightGBM + CatBoost, XGBoost + best deep model, and all-available-model ensembles
-- Logistic-regression stacking over model probabilities
+- Standardized logistic-regression stacking over validation-only model probabilities with multiple regularization strengths
+- Optional LightGBM meta-stacking over validation-only model probabilities
 
 ## Feature Engineering
 
@@ -198,6 +227,9 @@ The preprocessing pipeline adds leakage-safe row-level features before splitting
 - medication active/change counts
 - insulin usage/change flags
 - medications and lab procedures per hospital day
+- split-level missing-value indicators fitted on the training split
+- split-level log transforms for skewed nonnegative numeric features
+- split-level pairwise interactions among the top training-correlated numeric features
 
 ## Metrics
 
@@ -211,13 +243,14 @@ Each model is evaluated using predicted probabilities and a validation-selected 
 - F1 score
 - Confusion matrix
 
-The default helper supports threshold tuning to maximize validation F1 or meet a recall target. For recall-target rows, the threshold is selected on the validation set as the highest-precision threshold satisfying `recall >= --min-recall`. The test set is used only after the threshold is fixed.
+The default helper supports threshold tuning to maximize validation F1 or meet a recall target. For recall-target rows, the threshold is selected on the validation set as the highest-precision threshold satisfying `recall >= --min-recall`. The test set is used only after the threshold is fixed. `results/metrics.csv` and `results/thresholds.csv` use `recall_target` as a boolean row marker and `min_recall` for the numeric target.
 
 ## Outputs
 
 - `results/metrics.csv`: model comparison table
 - `results/thresholds.csv`: selected thresholds and threshold-specific confusion counts
 - `results/model_rankings.csv`: models sorted by test PR-AUC and precision at the recall target
+- `results/model_ablation.csv`: XGBoost-only and ensemble ablations using validation-tuned weights
 - `results/predictions/`: validation and test probabilities for each model
 - `results/figures/`: class distribution, ROC curves, PR curves, confusion matrices, feature importance, metric comparison plots
 - `results/models/`: trained model artifacts and preprocessors
